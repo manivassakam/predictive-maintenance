@@ -1,0 +1,155 @@
+---
+title: "Predictive Maintenance Algorithm for Semiconductor Manufacturing Line"
+author: "M MANIVASSAKAM"
+date: "December 24, 2017"
+output: html_document
+---
+
+```{r}
+library(data.table)   # Read Data
+library(DMwR)         # Data Imputation by Knn
+library(ROSE)         # Synthetic Data Generation
+library(glmnet)       # Lasso Regression
+library(plotmo)       # Lasso Regression Visualization
+library(xgboost)      # Gradient Boosting Machine
+library(caret)        # Cross Validation
+library(dplyr)
+```
+
+```{r}
+feature <- fread("C:/myGitCodeBase/version-control/predictive-maintenance/secom.txt", data.table = F)
+label <- fread("C:/myGitCodeBase/version-control/predictive-maintenance/secom_labels.txt", data.table = F)
+data <- cbind(label,feature)
+colnames(data) <- c("Class", "Time", paste0(rep("Sensor", ncol(feature)), seq(1,ncol(feature))))
+data$Class <- factor(data$Class, labels = c("pass", "fail"))
+data$Time <-  as.POSIXct(data$Time, format = "%d/%m/%Y %H:%M:%S", tz = "GMT")
+```
+
+```{r}
+# Write CSV in R
+write.csv(data, file = "SECOMData.csv")
+```
+
+
+```{r}
+str(data, list.len=8)
+summary(data[,1:8])
+
+```
+
+#Data Preprocessing
+# After observe all variables, there are two kinds of situation that needs to be correct which is "Redundant" and "Missing Value".
+
+#Variable Redundant
+#Drop the equal value features and variable "Time" which we do not concern in this study.
+```{r}
+# Time #
+index_vr1 <- which(colnames(data) == "Time")
+
+# Equal Value #
+equal_v <- apply(data, 2, function(x) max(na.omit(x)) == min(na.omit(x)))
+index_vr2 <- which(equal_v == T)
+```
+
+```{r}
+# Missing Value Imputation #
+ncol(data)
+nrow(data)
+col_NA <- apply(data, 2, function(x) sum(is.na(x))/nrow(data))
+plot(col_NA,xlab="Sensor Number",ylab="Percentage(%)",main = "Percentage of Mission Sensor Values", pch=3)
+
+
+
+```
+
+```{r}
+index_mr <- which(col_NA > 0.4)
+data_c <- data[,-unique(c(index_vr1, index_vr2, index_mr))]
+dim(data_c)
+data_imputed  <- knnImputation(data_c)
+
+```
+#Training & Testing
+# Split the dataset into training and testing for the model construction and validation.
+```{r}
+set.seed(2)
+index <- sample(1:nrow(data_imputed), nrow(data_imputed)/10)
+train <- data_imputed[-index,]
+test <- data_imputed[index,]
+
+head(train)
+
+table(train$Class)
+```
+#Synthetic Data Generation
+#In order to deal with imbalance data, we applied a sampling method called "SMOTE algorithm". 
+#It uses bootstrapping and k-nearest #neighbors to generate artificial data. More detail can be study in following article. 
+```{r}
+train_rose <- ROSE(Class ~ ., data = train, seed = 1)$data
+table(train_rose$Class)
+```
+
+#Feature Selection
+#Lasso Regression
+```{r}
+fit_LS <- glmnet(as.matrix(train_rose[,-1]), train_rose[,1], family="binomial", alpha=1)
+plot_glmnet(fit_LS, "lambda", label=5)
+
+fit_LS_cv <- cv.glmnet(as.matrix(train_rose[,-1]), as.matrix(as.numeric(train_rose[,1])-1), type.measure="class", family="binomial", alpha=1)
+plot(fit_LS_cv)
+```
+
+```{r}
+coef <- coef(fit_LS_cv, s = "lambda.min")
+coef_df <- as.data.frame(as.matrix(coef))
+index_LS <- rownames(coef_df)[which(coef_df[,1] != 0)][-1]
+length(index_LS)
+
+```
+#Model Construction
+#Logistic Regression
+```{r}
+fit_LR <- glm(Class ~ ., data=train_rose[,c("Class",index_LS)], family = "binomial")
+table_LR <- round(summary(fit_LR)$coefficient, 4)
+table_LR[order(table_LR[,4])[1:20],]
+```
+
+```{r}
+pred_LR <- factor(ifelse(predict(fit_LR, test, type = "response") > 0.5, "fail", "pass"), levels = c("pass", "fail"))
+table(test$Class, pred_LR)
+roc.curve(test$Class, predict(fit_LR, test))
+
+```
+
+#Gradient Boosting Machine
+
+```{r}
+params <- list(
+  "objective"           = "reg:logistic",
+  "eval_metric"         = "logloss",
+  "eta"                 = 0.1,
+  "max_depth"           = 3,
+  "min_child_weight"    = 10,
+  "gamma"               = 0.70,
+  "subsample"           = 0.76,
+  "colsample_bytree"    = 0.95,
+  "alpha"               = 2e-05,
+  "lambda"              = 10
+)
+X <- xgb.DMatrix(as.matrix(train %>% select(-Class)), label = as.numeric(train$Class)-1)
+fit_GBM <- xgboost(data = X, params = params, nrounds = 50, verbose = 0)
+importance <- xgb.importance(colnames(train), model = fit_GBM)
+xgb.plot.importance(importance[1:20])
+```
+
+```{r}
+Y <- xgb.DMatrix(as.matrix(test %>% select(-Class)))
+pred_GBM <- factor(ifelse(predict(fit_GBM, Y) > 0.07, "fail", "pass"), levels = c("pass", "fail"))
+table(test$Class, pred_GBM)
+```
+
+```{r}
+roc.curve(test$Class, predict(fit_GBM, Y))
+
+```
+
